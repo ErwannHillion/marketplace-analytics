@@ -111,8 +111,9 @@ def replace_staging(connection, payloads, day):
             cursor.execute("SELECT pg_advisory_xact_lock(72431001)")
             cursor.execute("DELETE FROM staging.order_items WHERE dt=%s", (day,))
             cursor.execute("DELETE FROM staging.orders WHERE dt=%s", (day,))
-            for resource in ("products", "customers", "sellers"):
-                cursor.execute(f"DELETE FROM staging.{resource}")
+            # Contract section 3.1: refresh reference snapshots with TRUNCATE.
+            # It stays in this transaction so any failed INSERT restores them.
+            cursor.execute("TRUNCATE TABLE staging.products, staging.customers, staging.sellers")
             for resource in ("sellers", "customers", "products"):
                 insert_rows(cursor, resource, REF_COLUMNS[resource], rows[resource])
             insert_rows(cursor, "orders", ("order_id", "dt", "order_ts", "customer_id", "seller_id", "status", "currency", "total_amount"), rows["orders"])
