@@ -105,7 +105,12 @@ services:
   # Cree le bucket raw/ puis s'arrete. L'image est distroless (aucun shell),
   # d'ou l'attente active cote script plutot qu'un healthcheck sur le serveur.
   minio-init:
+    # Meme build que l'API : sans la directive build, Compose chercherait
+    # l'image sur Docker Hub (pull access denied) au lieu de la construire.
+    build: ./api
     image: marketplace-analytics/api:local
+    # Image locale uniquement : interdit a Compose d'essayer un pull.
+    pull_policy: build
     container_name: mpa-minio-init
     depends_on:
       api-simulee:
@@ -125,6 +130,8 @@ services:
   api-simulee:
     build: ./api
     image: marketplace-analytics/api:local
+    # Image locale uniquement : interdit a Compose d'essayer un pull.
+    pull_policy: build
     container_name: mpa-api
     environment:
       MARKETPLACE_API_TOKEN: ${MARKETPLACE_API_TOKEN}
