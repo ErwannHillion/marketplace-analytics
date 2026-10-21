@@ -1,0 +1,267 @@
+# Stack MarketPlace Analytics
+#
+#   docker compose up -d --build        stack principale
+#   docker compose --profile metabase up -d    + Metabase (option 1 de la partie 2)
+#
+# Les identifiants et les ports sont pilotes par le fichier .env
+# (copier .env.example vers .env avant le premier demarrage).
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.1.8
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+      postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres-airflow:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/auth/simple_auth_manager_passwords.json
+
+    # Connexions pre-provisionnees : utilisables directement dans les DAGs
+    # sous les conn_id marketplace_api / dwh_postgres / minio_s3
+    # (cf. docs/contracts.md section 3.2).
+    AIRFLOW_CONN_MARKETPLACE_API: >-
+      {"conn_type": "http", "host": "http://api-simulee:5000",
+       "password": "${MARKETPLACE_API_TOKEN}"}
+    AIRFLOW_CONN_DWH_POSTGRES: >-
+      {"conn_type": "postgres", "host": "postgres-dwh", "port": 5432,
+       "login": "${DWH_USER}", "password": "${DWH_PASSWORD}", "schema": "${DWH_DB}"}
+    AIRFLOW_CONN_MINIO_S3: >-
+      {"conn_type": "aws", "login": "${MINIO_ACCESS_KEY}", "password": "${MINIO_SECRET_KEY}",
+       "extra": {"endpoint_url": "http://minio:9000", "region_name": "us-east-1"}}
+
+    MINIO_RAW_BUCKET: ${MINIO_RAW_BUCKET}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./plugins:/opt/airflow/plugins
+    - ./sql:/opt/airflow/sql:ro
+    - airflow_logs:/opt/airflow/logs
+    - airflow_auth:/opt/airflow/auth
+  depends_on:
+    postgres-airflow:
+      condition: service_healthy
+
+services:
+
+  # --- Bases de donnees ---------------------------------------------------
+
+  postgres-airflow:
+    image: postgres:16
+    container_name: mpa-postgres-airflow
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER} -d ${AIRFLOW_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  postgres-dwh:
+    image: postgres:16
+    container_name: mpa-postgres-dwh
+    environment:
+      POSTGRES_USER: ${DWH_USER}
+      POSTGRES_PASSWORD: ${DWH_PASSWORD}
+      POSTGRES_DB: ${DWH_DB}
+    ports:
+      - "${DWH_HOST_PORT}:5432"
+    volumes:
+      - postgres_dwh_data:/var/lib/postgresql/data
+      # Joue uniquement au premier demarrage, quand le volume est vide.
+      - ./sql/ddl/00_schemas.sql:/docker-entrypoint-initdb.d/00_schemas.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DWH_USER} -d ${DWH_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # --- Stockage objet -----------------------------------------------------
+
+  # Image Chainguard : les depots minio/minio et bitnami/minio ont ete
+  # retires de Docker Hub apres l'archivage du projet MinIO. C'est le meme
+  # serveur MinIO, simplement redistribue (voir README).
+  minio:
+    image: chainguard/minio:latest
+    container_name: mpa-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    ports:
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+
+  # Cree le bucket raw/ puis s'arrete. L'image est distroless (aucun shell),
+  # d'ou l'attente active cote script plutot qu'un healthcheck sur le serveur.
+  minio-init:
+    image: marketplace-analytics/api:local
+    container_name: mpa-minio-init
+    depends_on:
+      api-simulee:
+        condition: service_started
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKETS: ${MINIO_RAW_BUCKET}
+    volumes:
+      - ./scripts:/scripts:ro
+    command: ["python", "/scripts/minio_bootstrap.py"]
+    restart: "no"
+
+  # --- Source de donnees --------------------------------------------------
+
+  api-simulee:
+    build: ./api
+    image: marketplace-analytics/api:local
+    container_name: mpa-api
+    environment:
+      MARKETPLACE_API_TOKEN: ${MARKETPLACE_API_TOKEN}
+      API_INJECT_ANOMALIES: ${API_INJECT_ANOMALIES}
+    ports:
+      - "${API_PORT}:5000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # --- Orchestration ------------------------------------------------------
+
+  # Les volumes nommes sont crees root-owned par Docker, alors qu'Airflow
+  # tourne en uid 50000 : sans ce prealable, ni les logs ni le fichier de
+  # mots de passe ne sont writables. S'execute en root puis s'arrete.
+  airflow-perms:
+    image: alpine:latest
+    container_name: mpa-airflow-perms
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p /opt/airflow/logs /opt/airflow/auth && chown -R 50000:0 /opt/airflow/logs /opt/airflow/auth && chmod -R 775 /opt/airflow/logs /opt/airflow/auth"]
+    volumes:
+      - airflow_logs:/opt/airflow/logs
+      - airflow_auth:/opt/airflow/auth
+    restart: "no"
+
+  # Migre la base de metadonnees et fixe le mot de passe de l'UI, puis s'arrete.
+  airflow-init:
+    <<: *airflow-common
+    container_name: mpa-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        python - <<'PY'
+        import json, os, pathlib
+        target = pathlib.Path("/opt/airflow/auth/simple_auth_manager_passwords.json")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"admin": os.environ["AIRFLOW_ADMIN_PASSWORD"]}))
+        print("Utilisateur UI : admin")
+        PY
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-perms:
+        condition: service_completed_successfully
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: mpa-airflow-apiserver
+    command: ["api-server"]
+    ports:
+      - "${AIRFLOW_PORT}:8080"
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-perms:
+        condition: service_completed_successfully
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: mpa-airflow-scheduler
+    command: ["scheduler"]
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-perms:
+        condition: service_completed_successfully
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: mpa-airflow-dag-processor
+    command: ["dag-processor"]
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-perms:
+        condition: service_completed_successfully
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: mpa-airflow-triggerer
+    command: ["triggerer"]
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-perms:
+        condition: service_completed_successfully
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # --- Serving (partie 2, optionnel) --------------------------------------
+
+  metabase:
+    image: metabase/metabase:latest
+    container_name: mpa-metabase
+    profiles: ["metabase"]
+    ports:
+      - "${METABASE_PORT}:3000"
+    volumes:
+      - metabase_data:/metabase-data
+    environment:
+      MB_DB_FILE: /metabase-data/metabase.db
+    depends_on:
+      postgres-dwh:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_airflow_data:
+  postgres_dwh_data:
+  minio_data:
+  airflow_logs:
+  airflow_auth:
+  metabase_data:
