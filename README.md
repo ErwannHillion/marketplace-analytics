@@ -1,362 +1,83 @@
-# Projet A — MarketPlace Analytics
+# Marketplace Analytics
 
-> **Focus :** Orchestration ELT classique, idempotence, qualité de données, dashboards
+Pipeline ELT quotidien pour une marketplace simulée : API Flask, archivage brut dans MinIO, entrepôt PostgreSQL et tableaux de bord Metabase. Airflow orchestre les étapes et transmet les partitions traitées entre DAGs avec des Assets.
 
-## Le pitch
-
-Vous êtes Data Engineer dans une marketplace e-commerce (type Etsy, Vinted, Backmarket).
-Des dizaines de vendeurs y publient leurs produits, les clients achètent, les commandes
-s'accumulent. Votre mission : construire la plateforme data qui alimente les dashboards
-business (top vendeurs, revenu par catégorie, taux de churn client) et détecte les
-anomalies commerciales (drop de ventes, prix suspects).
-
-C'est un projet **ELT batch pur** — parfait pour les groupes qui veulent maîtriser les
-fondamentaux d'Airflow sans se disperser sur du streaming.
-
-## Objectifs pédagogiques
-
-- Construire un pipeline ELT idempotent de bout en bout (API -> S3 -> PostgreSQL -> Analytics)
-- Implémenter un **Custom Hook** pour l'API marketplace avec auth Bearer
-- Implémenter un **Custom Operator** de data quality avec règles configurables
-- Concevoir des **tables faits/dimensions** simples (modélisation dimensionnelle)
-- Exposer les KPIs via un dashboard **Metabase** ou **Streamlit**
-- Détecter des anomalies business simples (écart à la moyenne, seuils)
-
-## Architecture cible
+## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph t_sources["Sources"]
-        t_api[("API Marketplace<br/>Flask simulee")]
-    end
-
-    subgraph t_orchestration["Orchestration"]
-        t_airflow[["Airflow 3.1.8<br/>DAGs ELT"]]
-    end
-
-    subgraph t_storage["Stockage"]
-        t_minio[("MinIO<br/>raw/ partition dt=")]
-        t_pg[("PostgreSQL DWH<br/>staging / dwh / analytics")]
-    end
-
-    subgraph t_serving["Serving"]
-        t_meta["Metabase<br/>ou Streamlit"]
-    end
-
-    t_api -- "extract via Custom Hook" --> t_airflow
-    t_airflow -- "raw JSON" --> t_minio
-    t_airflow -- "load + transform" --> t_pg
-    t_pg --> t_meta
-
-    style t_airflow fill:#4a90d9,color:#fff
-    style t_pg fill:#f5a623,color:#000
-    style t_meta fill:#4caf50,color:#fff
+    API[API Flask] -->|JSON brut| ING[Airflow ingestion]
+    ING -->|objets datés| MINIO[(MinIO / bucket raw)]
+    MINIO -->|lecture + contrôle| STG[(PostgreSQL staging)]
+    STG -->|dimensions + faits| DWH[(PostgreSQL dwh)]
+    DWH -->|agrégats + alertes| MART[(PostgreSQL analytics)]
+    MART --> MB[Metabase]
+    ING -. Asset raw_orders .-> BUILD[DAG construction DWH]
+    BUILD -. Asset dwh_orders .-> AGG[DAG analytics]
 ```
 
-## Modèle de données cible
+Les deux bases PostgreSQL ont des rôles séparés : `postgres-airflow` conserve l’état et les métadonnées d’Airflow; `postgres-dwh` conserve staging, DWH, analytics et la base applicative Metabase. Metabase utilise sa propre base (`METABASE_DB`) pour ses comptes, questions et dashboards, sans écrire dans les tables métier. Les volumes Docker nommés conservent les données au redémarrage.
 
-```mermaid
-erDiagram
-    DIM_SELLER ||--o{ FACT_ORDERS : vends
-    DIM_CUSTOMER ||--o{ FACT_ORDERS : achete
-    DIM_PRODUCT ||--o{ FACT_ORDERS : contient
-    DIM_DATE ||--o{ FACT_ORDERS : datee
+## Parcours des données
 
-    DIM_SELLER {
-        string seller_id PK
-        string name
-        string country
-        date joined_date
-    }
-    DIM_CUSTOMER {
-        string customer_id PK
-        string email
-        string city
-        date signup_date
-    }
-    DIM_PRODUCT {
-        string product_id PK
-        string name
-        string category
-        decimal base_price
-    }
-    DIM_DATE {
-        date dt PK
-        int year
-        int month
-        int day_of_week
-    }
-    FACT_ORDERS {
-        string order_id PK
-        string seller_id FK
-        string customer_id FK
-        string product_id FK
-        date dt FK
-        int quantity
-        decimal total_amount
-        string status
-    }
-```
+1. `marketplace_orders_ingest_daily` appelle l’API pour les commandes du jour UTC et les référentiels vendeurs, produits et clients. Le hook conserve le corps JSON tel que reçu dans `raw/marketplace/<ressource>/dt=YYYY-MM-DD/`. Les objets sont remplacés lors d’une relance de la même date. XCom ne transporte que les clés et empreintes SHA-256.
+2. La tâche de chargement relit MinIO, vérifie les empreintes et le contrat des payloads, puis remplace transactionnellement les lignes de staging de cette date. Les snapshots de référence sont également remplacés. Une erreur annule la transaction.
+3. `marketplace_dwh_build_daily`, déclenché par l’Asset `raw_orders`, met à jour les dimensions et remplace la partition de faits. `dwh.fact_orders` a une ligne par article commandé, clé `(order_id, product_id)`.
+4. `marketplace_analytics_aggregate_daily`, déclenché par `dwh_orders`, produit le CA quotidien, les commissions, le CA par vendeur et par catégorie, l’activité client et les anomalies. Les tables dérivées sont recalculables sans doublons.
+5. Metabase lit uniquement les tables `analytics` pour afficher les indicateurs. Le script `dashboards/publish_metabase_dashboard.py` publie ou complète les cinq cartes du dashboard.
 
-## Découpage en 2 jours
+Le CA comprend les commandes aux statuts `paid`, `shipped` et `delivered`, en EUR. Le taux de commission est configurable par `MARKETPLACE_COMMISSION_RATE` (0.12, soit 12 % par défaut). L’anomalie US-05 compare le CA d’un jour à 70 % de la moyenne des sept jours calendaires précédents, jour courant exclu.
 
-### Partie 1 : Pipeline ELT de base
+## Tables et dashboards
 
-```mermaid
-flowchart LR
-    t_1["1. Extract<br/>Custom Hook API"] --> t_2["2. Upload raw<br/>MinIO partition dt="]
-    t_2 --> t_3["3. Load staging<br/>PostgreSQL"]
-    t_3 --> t_4["4. DQ check<br/>Custom Operator"]
-    t_4 --> t_5["5. Build dwh<br/>dim + fact tables"]
+- `staging`: `orders`, `order_items`, `sellers`, `products`, `customers`.
+- `dwh`: dimensions `dim_seller`, `dim_product`, `dim_customer`, `dim_date` et table de faits `fact_orders`.
+- `analytics`: `daily_revenue`, `seller_revenue_daily`, `category_revenue_daily`, `customer_activity`, `anomalies`.
 
-    style t_1 fill:#e1f5fe
-    style t_2 fill:#e1f5fe
-    style t_3 fill:#fff3e0
-    style t_4 fill:#ffebee
-    style t_5 fill:#e8f5e9
-```
+Les fichiers `sql/ddl/00_schemas.sql` à `30_analytics.sql` définissent ces tables. `dwh-bootstrap` applique ces DDL idempotents au démarrage, y compris si le volume existe déjà. Les contrats détaillés des payloads, clés MinIO et Assets sont dans [docs/contracts.md](docs/contracts.md).
 
-**Livrables :**
+Le dashboard **Marketplace — Pilotage quotidien** couvre :
 
-- [ ] DAG `marketplace_orders_ingest_daily` — extraction + upload raw + load staging
-- [ ] Custom Hook `MarketplaceAPIHook` avec méthodes `get_orders(date)`, `get_sellers()`, `get_products()`
-- [ ] Custom Operator `DataQualityOperator` avec 5 règles SQL configurables
-- [ ] DAG `marketplace_dwh_build_daily` — construction des dimensions + faits
-- [ ] Idempotence testée : relancer 3 fois la même date -> même résultat
-- [ ] Pattern `DELETE + INSERT` sur partition `dt = {{ ds }}`
+- US-01 : CA par jour sur 30 jours;
+- US-02 : top 10 vendeurs par revenu;
+- US-03 : commissions journalières à 12 %;
+- US-04 : CA par catégorie;
+- US-05 : jours sous le seuil des 70 %.
 
-### Partie 2 : Analytics & dashboard
+US-06 se fait en relançant le DAG d’ingestion sur une plage de dates dans Airflow; les deux DAGs aval suivent leurs Assets. US-07 : les échecs sont visibles dans Airflow. Une notification sortante nécessite un `AIRFLOW_ALERT_WEBHOOK_URL` configuré; sans cela le détail reste dans les logs Airflow.
 
-**Au choix du groupe** — option 1 ou 2 :
+## Démarrage
 
-#### Option 1 — Dashboard Metabase *(plus simple)*
+Copier `.env.example` vers `.env`, renseigner les secrets locaux, puis lancer depuis ce dossier :
 
-- Ajouter **Metabase** dans le docker-compose (`metabase/metabase:latest`)
-- Créer 4 dashboards dans Metabase connecté au PostgreSQL DWH :
-  - Top 10 vendeurs par revenu
-  - Évolution du CA par jour (7 derniers jours)
-  - Répartition des ventes par catégorie
-  - Clients actifs vs dormants
-- DAG `marketplace_analytics_aggregate_daily` qui alimente les tables d'agrégation lues par Metabase
-
-#### Option 2 — Dashboard Streamlit + détection d'anomalies *(plus technique)*
-
-- Ajouter un service **Streamlit** dans le docker-compose
-- DAG `marketplace_anomaly_detect_daily` qui :
-  - Calcule la moyenne mobile 7 jours du CA par vendeur
-  - Flag les vendeurs avec un drop > 30% vs la moyenne
-  - Écrit les anomalies dans `analytics.anomalies`
-  - Branching : si anomalies détectées -> appelle un webhook (simulé)
-- Dashboard Streamlit qui affiche les KPIs + les anomalies détectées
-
-## Stack Docker Compose
-
-| Service | Image | Port | Rôle |
-|---|---|---|---|
-| airflow-* | `apache/airflow:3.1.8` | 8080 | Orchestrateur |
-| postgres-airflow | `postgres:16` | 5432 | Metadata DB |
-| postgres-dwh | `postgres:16` | 5433 | Data Warehouse |
-| minio | `minio/minio` | 9000/9001 | Storage objet |
-| api-simulee | Flask custom | 5000 | API marketplace |
-| metabase | `metabase/metabase` | 3000 | Dashboards (option 1) |
-| streamlit | Python custom | 8501 | Dashboards (option 2) |
-
-## DAGs attendus
-
-```mermaid
-flowchart TD
-    subgraph t_j1["Jour 1"]
-        t_dag1["marketplace_orders_ingest_daily<br/>@daily"]
-        t_dag2["marketplace_dwh_build_daily<br/>schedule via Asset"]
-    end
-
-    subgraph t_j2["Jour 2"]
-        t_dag3["marketplace_analytics_aggregate_daily<br/>schedule via Asset"]
-        t_dag4["marketplace_anomaly_detect_daily<br/>@daily<br/>option 2"]
-    end
-
-    t_dag1 -- "Asset raw_orders" --> t_dag2
-    t_dag2 -- "Asset dwh_orders" --> t_dag3
-    t_dag2 -- "Asset dwh_orders" --> t_dag4
-
-    style t_dag1 fill:#4caf50,color:#fff
-    style t_dag2 fill:#4caf50,color:#fff
-    style t_dag3 fill:#ff9800,color:#fff
-    style t_dag4 fill:#ff9800,color:#fff
-```
-
-## Fonctionnalités bonus (si temps)
-
-- Slack / webhook alerting sur échec DAG
-- Tests pytest sur le Custom Operator (mock de la DB)
-- Backfill manuel sur 1 semaine de données historiques
-- Ajout d'une dimension `dim_category` enrichie avec un mapping externe
-
-## Organisation du dépôt
-
-| Dossier | Contenu |
-|---|---|
-| `dags/` | Les DAGs Airflow |
-| `plugins/hooks/` | `MarketplaceAPIHook` |
-| `plugins/operators/` | `DataQualityOperator` |
-| `sql/` | DDL des schémas staging / dwh / analytics, requêtes de transformation |
-| `api/` | API marketplace simulée (Flask) |
-| `dashboards/` | Config Metabase (option 1) ou app Streamlit (option 2) |
-| `tests/` | Tests pytest |
-| `docs/` | Notes d'architecture, captures des dashboards |
-
-## Demarrage de la stack
-
-```bash
-cp .env.example .env
-# Renseigner les secrets, notamment :
-#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"  -> AIRFLOW_FERNET_KEY
-#   python -c "import secrets; print(secrets.token_urlsafe(32))"                               -> AIRFLOW_JWT_SECRET
+```powershell
 docker compose up -d --build
+docker compose ps
 ```
 
-| Service | URL | Identifiants |
-|---|---|---|
-| Airflow | http://localhost:8080 | `admin` / `AIRFLOW_ADMIN_PASSWORD` |
-| API marketplace | http://localhost:5001 | en-tete `Authorization: Bearer $MARKETPLACE_API_TOKEN` |
-| Console MinIO | http://localhost:9001 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` |
-| PostgreSQL DWH | `localhost:5433` | `DWH_USER` / `DWH_PASSWORD`, base `marketplace` |
-| Metabase | http://localhost:3000 | compte a creer au premier lancement |
+Adresses par défaut : Airflow `http://localhost:8080`, Metabase `http://localhost:3000`, console MinIO `http://localhost:9001`, API `http://localhost:5001`. Les ports et paramètres sont dans `.env.example`. Depuis Metabase, PostgreSQL se joint avec l’hôte Docker `postgres-dwh` et le port interne `5432` (pas `localhost`).
 
-Quatre services s'executent une fois puis s'arretent, c'est normal : `airflow-perms`
-(droits sur les volumes), `airflow-init` (migration de la base, mot de passe UI),
-`minio-init` (creation du bucket `raw`) et `metabase-db-init` (base applicative de
-Metabase). Metabase met environ deux minutes a devenir `healthy` au premier
-demarrage, le temps de creer ses tables.
+Pour (re)publier le dashboard avec le compte administrateur Metabase déjà configuré :
 
-### Connections Airflow
-
-Les trois `conn_id` du contrat sont injectes par variables d'environnement
-(`AIRFLOW_CONN_*` dans le docker-compose), donc utilisables directement dans les DAGs
-sans aucun secret en dur :
-
-| `conn_id` | Type | Cible |
-|---|---|---|
-| `marketplace_api` | http | `http://api-simulee:5000`, jeton dans `password` |
-| `dwh_postgres` | postgres | `postgres-dwh:5432`, base `marketplace` |
-| `minio_s3` | aws | `endpoint_url=http://minio:9000` |
-
-Attention : `airflow connections list` ne les affiche **pas**, car elles ne sont pas
-stockees en base. Pour verifier qu'elles se resolvent :
-
-```bash
-docker compose exec airflow-scheduler python -c "
-from airflow.sdk import BaseHook
-print(BaseHook.get_connection('dwh_postgres').host)"
+```powershell
+python .\dashboards\publish_metabase_dashboard.py
 ```
 
-### Tests de l'API
+Le script lit les variables `METABASE_ADMIN_EMAIL` / `METABASE_ADMIN_PASSWORD` et `DWH_*` du `.env` local ou de l’environnement. Il ne journalise pas ces valeurs. Il réutilise les cartes et le dashboard existants. Les identifiants ne doivent pas être ajoutés au dépôt.
 
-```bash
-pip install -r tests/requirements.txt
-MARKETPLACE_API_TOKEN=<le-token-du-.env> API_BASE_URL=http://localhost:5001 \
-    pytest tests/test_api_contract.py -v
-```
+Les connexions Airflow `marketplace_api`, `dwh_postgres` et `minio_s3` sont injectées comme variables `AIRFLOW_CONN_*` dans Compose; aucun mot de passe n’est codé dans les DAGs. `airflow-init` et les autres services `*-init` s’arrêtent normalement après leur initialisation.
 
-20 tests couvrent l'authentification, les enveloppes JSON, les formats d'identifiants,
-les invariants des commandes (`total_amount`, produits du bon vendeur, unicite) et le
-determinisme du generateur.
+## Organisation du code
 
-## L'API simulee
+- `api/`: API Flask simulant les commandes et référentiels.
+- `dags/`: définition des tâches, dépendances, horaires, Assets et connexions.
+- `plugins/hooks/`: client API marketplace.
+- `plugins/ingestion/`: validation, normalisation et chargement transactionnel de staging.
+- `plugins/warehouse.py`: SQL de transformation staging → DWH → analytics, séparé de l’orchestration.
+- `plugins/marketplace_config.py`: identifiants de connexions et Assets partagés.
+- `plugins/marketplace_alerts.py`: notification optionnelle et callback d’échec.
+- `sql/ddl/`: contrats physiques des schémas et tables.
+- `dashboards/`: SQL des cartes et publication via l’API Metabase.
+- `docs/contracts.md`: contrats d’interface et de données.
 
-Routes, toutes authentifiees sauf `/health` :
-
-| Route | Reponse |
-|---|---|
-| `GET /health` | `{"status": "ok"}` — sans authentification |
-| `GET /orders?date=YYYY-MM-DD` | `{"date", "count", "orders"}` |
-| `GET /sellers` | `{"sellers": [...]}` |
-| `GET /products` | `{"products": [...]}` |
-| `GET /customers` | `{"customers": [...]}` |
-
-Les donnees ne sont pas tirees au hasard : chaque valeur est derivee par hachage
-SHA-256 de ses parametres. Une meme date renvoie donc toujours exactement les memes
-commandes, ce qui est la condition pour pouvoir tester l'idempotence des DAGs.
-12 vendeurs, environ 95 produits, 150 clients, et 25 a 65 commandes par jour.
-
-`API_INJECT_ANOMALIES=true` (defaut) ajoute de la matiere aux parties suivantes :
-
-- environ un jour sur sept, un vendeur perd ~80% de ses commandes (chute de CA a
-  detecter en partie 2) ;
-- environ une ligne de commande sur 200 porte un prix multiplie par 10 (anomalie a
-  rattraper par le `DataQualityOperator`).
-
-Mettre la variable a `false` produit un jeu de donnees propre.
-
-## Ce que l'infra fournit aux autres lots
-
-### Personne 2 — Ingestion
-
-- `plugins/` est monte sur `/opt/airflow/plugins`. Un hook place dans
-  `plugins/hooks/marketplace_api.py` s'importe depuis un DAG par
-  `from hooks.marketplace_api import MarketplaceAPIHook` (verifie : le dossier
-  n'est pas sur le `sys.path` d'un `python` nu, mais Airflow l'ajoute au
-  chargement des plugins, donc l'import fonctionne a l'interieur d'un DAG).
-- Connections `marketplace_api` et `minio_s3` deja provisionnees.
-- Bucket `raw` cree au demarrage.
-- Un nouveau fichier dans `dags/` est detecte en 30 secondes maximum
-  (`AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL`, au lieu des 300s par defaut).
-
-### Personne 3 — DWH et qualite
-
-- Connection `dwh_postgres` deja provisionnee.
-- Schemas `staging`, `dwh` et `analytics` crees dans la base `marketplace`.
-  Les tables, elles, restent a creer : la base contient volontairement 0 table.
-- `sql/` est monte en lecture seule sur `/opt/airflow/sql`, sous-dossiers inclus,
-  donc un operateur peut lire un fichier `.sql` directement.
-
-### Personne 4 — Analytics et dashboards
-
-Metabase tourne sur http://localhost:3000. Au premier lancement il demande de
-creer un compte administrateur, puis une connexion a la base a analyser.
-**Parametres a saisir dans Metabase** (vu depuis le reseau Docker, pas depuis la
-machine hote) :
-
-| Champ | Valeur |
-|---|---|
-| Type | PostgreSQL |
-| Host | `postgres-dwh` |
-| Port | `5432` |
-| Database | `marketplace` (valeur de `DWH_DB`) |
-| User / Password | `DWH_USER` / `DWH_PASSWORD` du `.env` |
-
-Erreur classique : saisir `localhost:5433`. Cela ne marche pas, car Metabase est
-dans un conteneur — ces valeurs ne sont valables que depuis la machine hote.
-
-Metabase stocke ses dashboards dans une base **`metabase`** separee, sur la meme
-instance PostgreSQL que le DWH. Il n'ecrit donc jamais dans les donnees metier.
-
-### Point a valider en equipe
-
-La repartition des taches annonce `sql/staging/`, `sql/dwh/` et `sql/analytics/`,
-alors que `docs/contracts.md` section 3.1 annonce `sql/ddl/` avec
-`00_schemas.sql`, `10_staging.sql`, `20_dwh.sql` et `30_analytics.sql`. Les deux
-arborescences existent dans le depot, avec la lecture suivante :
-
-- `sql/ddl/` : les `CREATE TABLE` (ce que decrit le contrat) ;
-- `sql/staging/`, `sql/dwh/`, `sql/analytics/` : les requetes de transformation
-  (ce que decrit la repartition des taches).
-
-A confirmer avant que les personnes 3 et 4 commencent, pour eviter que le contrat
-et le code divergent.
-
-## Points d'attention
-
-- **Port 5000 indisponible sur macOS.** ControlCenter (recepteur AirPlay) ecoute deja
-  dessus, d'ou `API_PORT=5001` cote hote. Le port **interne** du conteneur reste 5000 :
-  les DAGs appellent bien `http://api-simulee:5000` comme prevu au contrat.
-- **Port 5433 (DWH).** Valeur du sujet, conservee par defaut. En cas de conflit avec un
-  autre PostgreSQL deja en ecoute, changer `DWH_HOST_PORT` dans `.env`.
-- **MinIO vient de Chainguard, pas de Docker Hub.** Les depots `minio/minio` et
-  `bitnami/minio` ont ete retires apres l'archivage du projet MinIO, et `dl.min.io`
-  renvoie `410 Gone`. `chainguard/minio` est le meme serveur MinIO redistribue
-  (`RELEASE.2026-09-22`), teste conforme : API S3 sur 9000, console sur 9001. L'image
-  est distroless (aucun shell), donc pas de healthcheck Docker dessus : c'est
-  `minio-init` qui attend activement que le serveur reponde.
-- Les autres images (`apache/airflow:3.1.8`, `postgres:16`, `metabase/metabase`) se
-  telechargent normalement.
+Pour rejouer une date, créer un backfill du DAG `marketplace_orders_ingest_daily` depuis l’interface Airflow ou avec `airflow backfill create` en précisant les dates de début et de fin. Le timetable UTC traite la date de l’intervalle; le jour transmis dans l’Asset est ensuite utilisé par les tâches aval.

@@ -1,6 +1,6 @@
 # Contrats d'interface — MarketPlace Analytics
 
-> Statut : **proposition à valider**. Toute modification de ce fichier doit être répercutée
+> Statut : **contrat implémenté**. Toute modification de ce fichier doit être répercutée
 > dans l'API simulée, le Hook, les DDL et les DAGs dans le même commit.
 
 Conventions générales :
@@ -131,13 +131,13 @@ devient `line_amount`. Le montant total d'une commande se calcule par
 | `dwh` | `dim_seller` | 1 ligne / vendeur | upsert (`INSERT … ON CONFLICT`) |
 | `dwh` | `dim_product` | 1 ligne / produit | upsert |
 | `dwh` | `dim_customer` | 1 ligne / client | upsert |
-| `dwh` | `dim_date` | 1 ligne / jour | généré une fois (2024-01-01 → 2027-12-31) |
+| `dwh` | `dim_date` | 1 ligne / jour traité | ajoutée au fil des partitions traitées |
 | `dwh` | `fact_orders` | 1 ligne / produit commandé | `DELETE WHERE dt = …` + `INSERT` |
-| `analytics` | `daily_revenue` | 1 ligne / jour | `DELETE WHERE dt = …` + `INSERT` |
+| `analytics` | `daily_revenue` | 1 ligne / jour | upsert sur `dt` |
 | `analytics` | `seller_revenue_daily` | 1 ligne / vendeur / jour | idem |
 | `analytics` | `category_revenue_daily` | 1 ligne / catégorie / jour | idem |
 | `analytics` | `customer_activity` | 1 ligne / client | recalcul complet |
-| `analytics` | `anomalies` | 1 ligne / vendeur / jour en anomalie | `DELETE WHERE dt = …` + `INSERT` |
+| `analytics` | `anomalies` | 1 ligne / jour en anomalie | upsert si anomalie, suppression si le seuil n'est plus franchi |
 
 Les DDL sont versionnés dans `sql/ddl/` (`00_schemas.sql`, `10_staging.sql`, `20_dwh.sql`,
 `30_analytics.sql`).
@@ -209,7 +209,7 @@ flowchart LR
 | Asset (`name`) | URI | Émis par la tâche |
 |---|---|---|
 | `raw_orders` | `s3://raw/marketplace/orders` | `load_staging` (dernière tâche de l'ingestion, une fois MinIO **et** staging chargés) |
-| `dwh_orders` | `postgres://postgres-dwh:5432/marketplace/dwh/fact_orders` | `build_fact_orders` (après le DQ check) |
+| `dwh_orders` | `postgres://postgres-dwh:5432/marketplace/dwh/fact_orders` | `build_fact_orders` (après commit du DWH) |
 
 **Point essentiel :** dans Airflow 3, un run déclenché par un Asset n'a **pas** de
 `logical_date`, donc pas de `{{ ds }}`. La date voyage dans l'`extra` de l'événement :

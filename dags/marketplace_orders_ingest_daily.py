@@ -14,6 +14,7 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from hooks.marketplace_api_hook import MarketplaceAPIHook
 from ingestion.staging import replace_staging
 from marketplace_config import API_CONN_ID, MINIO_CONN_ID, DWH_CONN_ID, RAW_ORDERS
+from marketplace_alerts import dag_failure
 
 
 @task
@@ -59,7 +60,7 @@ with DAG(
     start_date=datetime(2026, 4, 1, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
-    default_args={"retries": 2, "retry_delay": timedelta(seconds=15)},
+    default_args={"retries": 2, "retry_delay": timedelta(seconds=15), "on_failure_callback": dag_failure},
     tags=["marketplace", "ingestion"],
 ) as dag:
     load_staging(extract_and_archive())

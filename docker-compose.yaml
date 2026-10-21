@@ -10,6 +10,9 @@ x-airflow-common: &airflow-common
   image: apache/airflow:3.1.8
   environment: &airflow-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # La concurrence par defaut (CPU count) sature Docker Desktop pendant les backfills.
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "4"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
@@ -36,6 +39,8 @@ x-airflow-common: &airflow-common
        "extra": {"endpoint_url": "http://minio:9000", "region_name": "us-east-1"}}
 
     MINIO_RAW_BUCKET: ${MINIO_RAW_BUCKET}
+    MARKETPLACE_COMMISSION_RATE: ${MARKETPLACE_COMMISSION_RATE:-0.12}
+    AIRFLOW_ALERT_WEBHOOK_URL: ${AIRFLOW_ALERT_WEBHOOK_URL:-}
   volumes:
     - ./dags:/opt/airflow/dags
     - ./plugins:/opt/airflow/plugins
@@ -85,6 +90,24 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
+
+  # Applique les DDL a chaque demarrage (les CREATE sont idempotents), y
+  # compris quand le volume PostgreSQL existait deja.
+  dwh-bootstrap:
+    image: postgres:16
+    container_name: mpa-dwh-bootstrap
+    environment:
+      PGHOST: postgres-dwh
+      PGUSER: ${DWH_USER}
+      PGPASSWORD: ${DWH_PASSWORD}
+      PGDATABASE: ${DWH_DB}
+    volumes:
+      - ./sql/ddl:/ddl:ro
+    command: ["sh", "-c", "for file in /ddl/00_schemas.sql /ddl/10_staging.sql /ddl/20_dwh.sql /ddl/30_analytics.sql; do psql -v ON_ERROR_STOP=1 -f \"$$file\" || exit 1; done"]
+    depends_on:
+      postgres-dwh:
+        condition: service_healthy
+    restart: "no"
 
   # --- Stockage objet -----------------------------------------------------
 
@@ -187,6 +210,8 @@ services:
     depends_on:
       postgres-airflow:
         condition: service_healthy
+      dwh-bootstrap:
+        condition: service_completed_successfully
       airflow-perms:
         condition: service_completed_successfully
     restart: "no"
