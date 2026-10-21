@@ -139,8 +139,9 @@ devient `line_amount`. Le montant total d'une commande se calcule par
 | `analytics` | `customer_activity` | 1 ligne / client | recalcul complet |
 | `analytics` | `anomalies` | 1 ligne / vendeur / jour en anomalie | `DELETE WHERE dt = …` + `INSERT` |
 
-Les DDL sont versionnés dans `sql/ddl/` (`00_schemas.sql`, `10_staging.sql`, `20_dwh.sql`,
-`30_analytics.sql`).
+Les DDL sont versionnés par schéma : `sql/ddl/00_schemas.sql` (schémas), `sql/staging/00_tables.sql`,
+`sql/dwh/00_tables.sql` et `sql/analytics/`. `dwh.dim_product` porte aussi `seller_id` (clé étrangère
+vers `dim_seller`). Colonnes et transformations du DWH : [dwh.md](dwh.md).
 
 ### 3.2 Connections Airflow
 
@@ -209,7 +210,7 @@ flowchart LR
 | Asset (`name`) | URI | Émis par la tâche |
 |---|---|---|
 | `raw_orders` | `s3://raw/marketplace/orders` | `load_staging` (dernière tâche de l'ingestion, une fois MinIO **et** staging chargés) |
-| `dwh_orders` | `postgres://postgres-dwh:5432/marketplace/dwh/fact_orders` | `build_fact_orders` (après le DQ check) |
+| `dwh_orders` | `postgres://postgres-dwh:5432/marketplace/dwh/fact_orders` | `build_dwh`, mappée : un événement par `dt` construite (après le DQ check) |
 
 **Point essentiel :** dans Airflow 3, un run déclenché par un Asset n'a **pas** de
 `logical_date`, donc pas de `{{ ds }}`. La date voyage dans l'`extra` de l'événement :
