@@ -215,19 +215,19 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Avec Metabase (option 1 de la partie 2) : `docker compose --profile metabase up -d`.
-
 | Service | URL | Identifiants |
 |---|---|---|
 | Airflow | http://localhost:8080 | `admin` / `AIRFLOW_ADMIN_PASSWORD` |
 | API marketplace | http://localhost:5001 | en-tete `Authorization: Bearer $MARKETPLACE_API_TOKEN` |
 | Console MinIO | http://localhost:9001 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` |
 | PostgreSQL DWH | `localhost:5433` | `DWH_USER` / `DWH_PASSWORD`, base `marketplace` |
-| Metabase | http://localhost:3000 | a creer au premier lancement |
+| Metabase | http://localhost:3000 | compte a creer au premier lancement |
 
-Trois services s'executent une fois puis s'arretent, c'est normal : `airflow-perms`
-(droits sur les volumes), `airflow-init` (migration de la base, mot de passe UI) et
-`minio-init` (creation du bucket `raw`).
+Quatre services s'executent une fois puis s'arretent, c'est normal : `airflow-perms`
+(droits sur les volumes), `airflow-init` (migration de la base, mot de passe UI),
+`minio-init` (creation du bucket `raw`) et `metabase-db-init` (base applicative de
+Metabase). Metabase met environ deux minutes a devenir `healthy` au premier
+demarrage, le temps de creer ses tables.
 
 ### Connections Airflow
 
@@ -287,6 +287,63 @@ commandes, ce qui est la condition pour pouvoir tester l'idempotence des DAGs.
   rattraper par le `DataQualityOperator`).
 
 Mettre la variable a `false` produit un jeu de donnees propre.
+
+## Ce que l'infra fournit aux autres lots
+
+### Personne 2 — Ingestion
+
+- `plugins/` est monte sur `/opt/airflow/plugins`. Un hook place dans
+  `plugins/hooks/marketplace_api.py` s'importe depuis un DAG par
+  `from hooks.marketplace_api import MarketplaceAPIHook` (verifie : le dossier
+  n'est pas sur le `sys.path` d'un `python` nu, mais Airflow l'ajoute au
+  chargement des plugins, donc l'import fonctionne a l'interieur d'un DAG).
+- Connections `marketplace_api` et `minio_s3` deja provisionnees.
+- Bucket `raw` cree au demarrage.
+- Un nouveau fichier dans `dags/` est detecte en 30 secondes maximum
+  (`AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL`, au lieu des 300s par defaut).
+
+### Personne 3 — DWH et qualite
+
+- Connection `dwh_postgres` deja provisionnee.
+- Schemas `staging`, `dwh` et `analytics` crees dans la base `marketplace`.
+  Les tables, elles, restent a creer : la base contient volontairement 0 table.
+- `sql/` est monte en lecture seule sur `/opt/airflow/sql`, sous-dossiers inclus,
+  donc un operateur peut lire un fichier `.sql` directement.
+
+### Personne 4 — Analytics et dashboards
+
+Metabase tourne sur http://localhost:3000. Au premier lancement il demande de
+creer un compte administrateur, puis une connexion a la base a analyser.
+**Parametres a saisir dans Metabase** (vu depuis le reseau Docker, pas depuis la
+machine hote) :
+
+| Champ | Valeur |
+|---|---|
+| Type | PostgreSQL |
+| Host | `postgres-dwh` |
+| Port | `5432` |
+| Database | `marketplace` (valeur de `DWH_DB`) |
+| User / Password | `DWH_USER` / `DWH_PASSWORD` du `.env` |
+
+Erreur classique : saisir `localhost:5433`. Cela ne marche pas, car Metabase est
+dans un conteneur — ces valeurs ne sont valables que depuis la machine hote.
+
+Metabase stocke ses dashboards dans une base **`metabase`** separee, sur la meme
+instance PostgreSQL que le DWH. Il n'ecrit donc jamais dans les donnees metier.
+
+### Point a valider en equipe
+
+La repartition des taches annonce `sql/staging/`, `sql/dwh/` et `sql/analytics/`,
+alors que `docs/contracts.md` section 3.1 annonce `sql/ddl/` avec
+`00_schemas.sql`, `10_staging.sql`, `20_dwh.sql` et `30_analytics.sql`. Les deux
+arborescences existent dans le depot, avec la lecture suivante :
+
+- `sql/ddl/` : les `CREATE TABLE` (ce que decrit le contrat) ;
+- `sql/staging/`, `sql/dwh/`, `sql/analytics/` : les requetes de transformation
+  (ce que decrit la repartition des taches).
+
+A confirmer avant que les personnes 3 et 4 commencent, pour eviter que le contrat
+et le code divergent.
 
 ## Points d'attention
 
