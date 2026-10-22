@@ -1,8 +1,4 @@
-"""Publish the two Marketplace dashboards through Metabase's HTTP API.
-
-Set credentials in the local .env or let the script prompt for them. It never
-prints credentials and can be rerun without duplicating cards or dashboards.
-"""
+"""Publish the four Marketplace dashboards through Metabase's HTTP API."""
 import json
 import os
 from getpass import getpass
@@ -63,51 +59,107 @@ if database is None:
     }, token)
 database_id = database["id"]
 
-# The month is anchored to the latest loaded date, so backfills and demos remain
-# useful even when the source data is not current-day data.
-dashboard_spec = {
-    "name": "Marketplace — Executive Summary",
-    "description": "CA et commissions, tendances, catégories, anomalies et top vendeurs du mois.",
-    "legacy_name": "Marketplace — Pilotage quotidien",
-    "cards": [
-        ("CA total — dernier jour", "scalar",
-         "SELECT revenue AS chiffre_affaires FROM analytics.daily_revenue "
-         "WHERE dt=(SELECT max(dt) FROM analytics.daily_revenue)",
-         0, 0, 12, 6),
-        ("Commission — dernier jour", "scalar",
-         "SELECT commission AS commission FROM analytics.daily_revenue "
-         "WHERE dt=(SELECT max(dt) FROM analytics.daily_revenue)",
-         0, 12, 12, 6),
-        ("CA et commission — évolution 30 jours", "line",
-         "SELECT dt AS jour,revenue AS chiffre_affaires,commission "
-         "FROM analytics.daily_revenue "
-         "WHERE dt >= (SELECT max(dt) FROM analytics.daily_revenue)-29 ORDER BY dt",
-         6, 0, 24, 7),
-        ("CA par catégorie — mois courant", "pie",
-         "SELECT category AS categorie,sum(revenue) AS chiffre_affaires "
-         "FROM analytics.category_revenue_daily "
-         "WHERE dt >= date_trunc('month',(SELECT max(dt) FROM analytics.daily_revenue))::date "
-         "AND dt <= (SELECT max(dt) FROM analytics.daily_revenue) "
-         "GROUP BY category ORDER BY chiffre_affaires DESC",
-         13, 0, 12, 7),
-        ("CA sous 70 % de la moyenne 7 jours — mois courant", "table",
-         "SELECT dt AS jour,actual_revenue AS chiffre_affaires,moyenne_7j,"
-         "threshold_revenue AS seuil_70pct,severity FROM ("
-         "SELECT a.dt,a.actual_revenue,a.avg_previous_7d AS moyenne_7j,"
-         "a.threshold_revenue,a.severity FROM analytics.anomalies a "
-         "WHERE a.dt >= date_trunc('month',(SELECT max(dt) FROM analytics.daily_revenue))::date "
-         "AND a.dt <= (SELECT max(dt) FROM analytics.daily_revenue)) anomalies_month "
-         "ORDER BY dt DESC",
-         13, 12, 12, 7),
-        ("Top 10 vendeurs — chiffre d’affaires du mois", "bar",
-         "SELECT seller_name AS vendeur,sum(revenue) AS chiffre_affaires "
-         "FROM analytics.seller_revenue_daily "
-         "WHERE dt >= date_trunc('month',(SELECT max(dt) FROM analytics.daily_revenue))::date "
-         "AND dt <= (SELECT max(dt) FROM analytics.daily_revenue) "
-         "GROUP BY seller_id,seller_name ORDER BY chiffre_affaires DESC LIMIT 10",
-         20, 0, 24, 8),
-    ],
-}
+# All relative periods use the latest loaded date, so historical backfills are
+# reflected in the dashboards without hardcoded dates.
+month_start = "date_trunc('month',(SELECT max(dt) FROM analytics.daily_revenue))::date"
+last_dt = "(SELECT max(dt) FROM analytics.daily_revenue)"
+dashboard_specs = [
+    {
+        "name": "Marketplace — Executive Summary",
+        "description": "Vue générale de la marketplace : CA du jour, tendance et meilleurs vendeurs.",
+        "legacy_name": "Marketplace — Pilotage quotidien",
+        "cards": [
+            ("CA total — dernier jour", "scalar",
+             f"SELECT revenue AS chiffre_affaires FROM analytics.daily_revenue WHERE dt={last_dt}",
+             0, 0, 12, 6),
+            ("Évolution du CA — 30 jours", "line",
+             f"SELECT dt AS jour,revenue AS chiffre_affaires FROM analytics.daily_revenue "
+             f"WHERE dt >= {last_dt}-29 ORDER BY dt",
+             0, 12, 12, 7),
+            ("Top 5 vendeurs — dernier jour", "bar",
+             f"SELECT seller_name AS vendeur,revenue AS chiffre_affaires "
+             f"FROM analytics.seller_revenue_daily WHERE dt={last_dt} "
+             "ORDER BY revenue DESC LIMIT 5",
+             7, 0, 24, 8),
+            ("Jours sous 70 % de la moyenne 7 jours — 30 jours", "table",
+             f"SELECT dt AS jour,actual_revenue AS chiffre_affaires,"
+             f"avg_previous_7d AS moyenne_7j,threshold_revenue AS seuil_70pct,severity "
+             f"FROM analytics.anomalies WHERE dt >= {last_dt}-29 AND dt <= {last_dt} "
+             "ORDER BY dt DESC",
+             15, 0, 24, 8),
+        ],
+    },
+    {
+        "name": "Marketplace — Top Sellers",
+        "description": "Performances mensuelles, évolution des meilleurs vendeurs et vendeurs inactifs.",
+        "legacy_name": None,
+        "cards": [
+            ("Top 10 vendeurs — mois", "bar",
+             f"SELECT seller_name AS vendeur,sum(revenue) AS chiffre_affaires "
+             f"FROM analytics.seller_revenue_daily WHERE dt >= {month_start} AND dt <= {last_dt} "
+             "GROUP BY seller_id,seller_name ORDER BY chiffre_affaires DESC LIMIT 10",
+             0, 0, 24, 8),
+            ("Évolution du CA des 3 meilleurs vendeurs — 30 jours", "line",
+             f"WITH top_sellers AS (SELECT seller_id FROM analytics.seller_revenue_daily "
+             f"WHERE dt >= {last_dt}-29 AND dt <= {last_dt} "
+             "GROUP BY seller_id ORDER BY sum(revenue) DESC LIMIT 3) "
+             f"SELECT d.dt AS jour,d.seller_name AS vendeur,d.revenue AS chiffre_affaires "
+             f"FROM analytics.seller_revenue_daily d JOIN top_sellers t USING(seller_id) "
+             f"WHERE d.dt >= {last_dt}-29 AND d.dt <= {last_dt} ORDER BY d.dt,d.seller_name",
+             8, 0, 24, 8),
+            ("Vendeurs inactifs depuis plus de 7 jours", "table",
+             f"SELECT s.seller_id,s.name AS vendeur,max(f.dt) AS derniere_vente "
+             "FROM dwh.dim_seller s LEFT JOIN dwh.fact_orders f ON f.seller_id=s.seller_id "
+             "AND f.status IN ('paid','shipped','delivered') "
+             "GROUP BY s.seller_id,s.name "
+             f"HAVING max(f.dt) IS NULL OR max(f.dt) < {last_dt}-7 "
+             "ORDER BY derniere_vente NULLS FIRST,s.name",
+             16, 0, 24, 8),
+        ],
+    },
+    {
+        "name": "Marketplace — Commissions",
+        "description": "Commissions du dernier jour, tendance sur 30 jours et total du mois.",
+        "legacy_name": None,
+        "cards": [
+            ("Commission totale — dernier jour", "scalar",
+             f"SELECT commission FROM analytics.daily_revenue WHERE dt={last_dt}",
+             0, 0, 12, 6),
+            ("Évolution des commissions — 30 jours", "line",
+             f"SELECT dt AS jour,commission FROM analytics.daily_revenue "
+             f"WHERE dt >= {last_dt}-29 ORDER BY dt",
+             0, 12, 12, 7),
+            ("Commissions totales — mois", "scalar",
+             f"SELECT coalesce(sum(commission),0) AS commissions_du_mois "
+             f"FROM analytics.daily_revenue WHERE dt >= {month_start} AND dt <= {last_dt}",
+             7, 0, 24, 6),
+        ],
+    },
+    {
+        "name": "Marketplace — Catégories",
+        "description": "Chiffre d'affaires par catégorie, part du CA et classement mensuel.",
+        "legacy_name": None,
+        "cards": [
+            ("CA par catégorie — mois", "bar",
+             f"SELECT category AS categorie,sum(revenue) AS chiffre_affaires "
+             f"FROM analytics.category_revenue_daily WHERE dt >= {month_start} AND dt <= {last_dt} "
+             "GROUP BY category ORDER BY chiffre_affaires DESC",
+             0, 0, 12, 8),
+            ("Part du CA par catégorie — mois", "pie",
+             f"SELECT category AS categorie,sum(revenue) AS chiffre_affaires "
+             f"FROM analytics.category_revenue_daily WHERE dt >= {month_start} AND dt <= {last_dt} "
+             "GROUP BY category ORDER BY chiffre_affaires DESC",
+             0, 12, 12, 8),
+            ("Classement des catégories par chiffre d’affaires", "table",
+             f"SELECT row_number() OVER (ORDER BY sum(revenue) DESC) AS rang, "
+             f"category AS categorie,sum(revenue) AS chiffre_affaires, "
+             f"round(100.0*sum(revenue)/nullif(sum(sum(revenue)) OVER (),0),2) AS part_pct "
+             f"FROM analytics.category_revenue_daily WHERE dt >= {month_start} AND dt <= {last_dt} "
+             "GROUP BY category ORDER BY chiffre_affaires DESC",
+             8, 0, 24, 8),
+        ],
+    },
+]
 
 existing_cards = request("/api/card", token=token)
 all_dashboards = request("/api/dashboard", token=token)
@@ -137,22 +189,15 @@ def publish_dashboard(spec):
             card = request("/api/card", card_payload, token)
             existing_cards.append(card)
         else:
-            # Keep the saved question aligned with the current SQL on reruns.
             request(f"/api/card/{card['id']}", card_payload, token, method="PUT")
         placements.append({"id": -1 - len(placements), "card_id": card["id"],
                            "row": row, "col": col, "size_x": size_x, "size_y": size_y})
 
-    dashboard_payload = {"name": spec["name"], "description": spec["description"],
-                         "dashcards": placements}
-    request(f"/api/dashboard/{dashboard['id']}", dashboard_payload, token, method="PUT")
-    dashboard_url = f"{BASE}/dashboard/{dashboard['id']}"
-    print(f"Dashboard publie : {spec['name']} — {dashboard_url}")
+    payload = {"name": spec["name"], "description": spec["description"],
+               "dashcards": placements}
+    request(f"/api/dashboard/{dashboard['id']}", payload, token, method="PUT")
+    print(f"Dashboard publié : {spec['name']} — {BASE}/dashboard/{dashboard['id']}")
 
 
-publish_dashboard(dashboard_spec)
-
-# The dashboard has been intentionally consolidated into Executive Summary.
-for dashboard in all_dashboards:
-    if dashboard.get("name") == "Marketplace — Top Sellers":
-        request(f"/api/dashboard/{dashboard['id']}", token=token, method="DELETE")
-        print(f"Dashboard supprime : {dashboard['name']}")
+for spec in dashboard_specs:
+    publish_dashboard(spec)
